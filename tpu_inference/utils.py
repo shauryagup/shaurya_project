@@ -160,6 +160,18 @@ def t2j(t: torch.Tensor, use_dlpack=False):
     return torchax_t2j(t, use_dlpack=use_dlpack)
 
 
+def t2np(t: torch.Tensor) -> np.ndarray:
+    """Converts a torch.Tensor to a host numpy array without going through a
+    JAX CPU device and without widening bf16/fp8 to float32: dtypes numpy
+    doesn't know are bit-cast through uint8 into the matching ml_dtypes dtype.
+    """
+    t = t.detach().cpu().contiguous()
+    if t.dtype in _NUMPY_UNSUPPORTED_DTYPES:
+        return t.reshape(-1).view(torch.uint8).numpy().view(
+            _NUMPY_UNSUPPORTED_DTYPES[t.dtype]).reshape(t.shape)
+    return t.numpy()
+
+
 _megacore = False
 
 

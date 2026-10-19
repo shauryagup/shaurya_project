@@ -35,6 +35,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.sharding import SingleDeviceSharding, get_mesh
 from safetensors import safe_open
+from vllm import envs as vllm_envs
 from vllm.config import ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
@@ -50,7 +51,7 @@ from tpu_inference.models.common.layer_filter import (
     filter_safetensors_by_layer, num_hidden_layers_override,
     should_skip_layer_weight)
 from tpu_inference.models.jax.utils import file_utils
-from tpu_inference.utils import t2j
+from tpu_inference.utils import t2j, t2np
 
 logger = init_logger(__name__)
 
@@ -231,7 +232,7 @@ def shard_put(x: jax.Array,
         mesh = get_mesh()
 
     x_mesh = None
-    if isinstance(x.sharding, NamedSharding):
+    if isinstance(getattr(x, "sharding", None), NamedSharding):
         x_mesh = x.sharding.mesh
 
     if math.prod(mesh.axis_sizes) == 1:
@@ -760,7 +761,8 @@ def jax_array_from_reshaped_torch(
         torch_weight: torch.Tensor,
         *,
         reshape_dims: Optional[tuple[int, ...]] = None,
-        permute_dims: Optional[tuple[int, ...]] = None) -> jax.Array:
+        permute_dims: Optional[tuple[int, ...]] = None
+) -> jax.Array | np.ndarray:
     """Convert a torch.Tensor to a jax.Array with reshaping and transposing.
 
     HuggingFace model almost always store linear layer weights with contracting dimension
@@ -778,6 +780,15 @@ def jax_array_from_reshaped_torch(
         permute_dims = (1, 0)
     if permute_dims is not None:
         torch_weight = torch_weight.permute(*permute_dims)
+
+    if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+        # Under Pathways the only CPU device is the single controller's
+        # TFRT_CPU_0; staging there costs an f32 widening (permuted tensors
+        # miss `t2j`'s bit-cast fast path), an XLA:CPU compile per shape and
+        # an extra device round trip before the proxy transfer. Return a host
+        # numpy array instead: `shard_put` sends it straight to the TPU
+        # sharding through the proxy.
+        return t2np(torch_weight)
 
     with cpu_mesh_context():
         return t2j(torch_weight, use_dlpack=False)
