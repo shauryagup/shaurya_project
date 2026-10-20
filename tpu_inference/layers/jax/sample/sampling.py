@@ -22,6 +22,7 @@ from jax import lax
 from jax.experimental.layout import Layout, with_layout_constraint
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+import vllm.envs as vllm_envs
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.v1.outputs import LogprobsTensors
 
@@ -260,8 +261,11 @@ def _distributed_topk_sample(
     Returns sampled global token IDs and a replicated scalar indicating that
     the gathered candidates may not contain the complete top-k tie group.
     """
-    logits_spec = P(None, ShardingAxisName.MLP_TENSOR)
-    replicated = P()
+    batch_axis = (ShardingAxisName.ATTN_DATA
+                  if vllm_envs.VLLM_TPU_USING_PATHWAYS else None)
+    logits_spec = P(batch_axis, ShardingAxisName.MLP_TENSOR)
+    batch_spec = P(batch_axis)
+    out_spec = P(batch_axis, None) if batch_axis is not None else P()
 
     def local_sample(local_logits, local_temperature):
         candidates_per_shard = _distributed_sampling_candidates_per_shard()
@@ -307,8 +311,8 @@ def _distributed_topk_sample(
     candidate_values, candidate_ids = jax.shard_map(
         local_sample,
         mesh=mesh,
-        in_specs=(logits_spec, replicated),
-        out_specs=(replicated, replicated),
+        in_specs=(logits_spec, batch_spec),
+        out_specs=(out_spec, out_spec),
         check_vma=False,
     )(logits, temperature)
 
@@ -375,7 +379,18 @@ def sample(
                                       processed_logits)
             return tokens, output_logits
 
-        if use_distributed_candidates:
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS and use_distributed_candidates:
+            sampled_tokens, _ = _distributed_topk_sample(
+                rng,
+                mesh,
+                logits,
+                tpu_sampling_metadata.temperature,
+                tpu_sampling_metadata.top_k,
+                tpu_sampling_metadata.top_p,
+            )
+            ret_tokens = jnp.where(is_greedy, greedy_tokens, sampled_tokens)
+            ret_logits = logits
+        elif use_distributed_candidates:
             # Candidate shapes use a trace-time maximum; each request's top-k
             # remains dynamic. Greedy and padded rows do not consume a sample.
             supported = _can_sample_distributed(tpu_sampling_metadata)
@@ -416,8 +431,10 @@ def sample(
     # (i.e. Ray based multi-host setup), we won't hit error like
     # RuntimeError: Fetching value for `jax.Array` that spans non-addressable
     # (non process local) devices is not possible.
-    next_tokens = jax.lax.with_sharding_constraint(ret_tokens,
-                                                   NamedSharding(mesh, P()))
+    out_spec = (P(ShardingAxisName.ATTN_DATA)
+                if vllm_envs.VLLM_TPU_USING_PATHWAYS else P())
+    next_tokens = jax.lax.with_sharding_constraint(
+        ret_tokens, NamedSharding(mesh, out_spec))
     return next_tokens, ret_logits
 
 

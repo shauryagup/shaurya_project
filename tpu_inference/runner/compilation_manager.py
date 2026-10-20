@@ -135,6 +135,12 @@ class CompilationManager:
             assert shape[
                 1] % tp_size == 0, f"Dimension size {shape[1]} is not divisible by TP size {tp_size} for shape {shape}"
 
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            return jnp.ones(
+                shape,
+                dtype=to_jax_dtype(dtype),
+                device=sharding
+                or NamedSharding(self.runner.mesh, PartitionSpec()))
         tensor = jnp.ones(shape, dtype=to_jax_dtype(dtype))
         if sharding:
             return device_array(self.runner.mesh, tensor, sharding=sharding)
@@ -246,13 +252,19 @@ class CompilationManager:
         # collectives.
         _sync_hosts("flush_pre_warmup")
         warmup_start = time.perf_counter()
+        last_out = None
         with jax.set_mesh(self.runner.mesh):
             for name, fn, args, call_kwargs, warmup_handler in tasks:
                 if warmup_handler is not None:
                     out = warmup_handler(fn, args, call_kwargs)
                 else:
                     out = fn(*args, **call_kwargs)
-                jax.tree.map(lambda r: r.block_until_ready(), out)
+                if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+                    last_out = out
+                else:
+                    jax.tree.map(lambda r: r.block_until_ready(), out)
+            if last_out is not None:
+                jax.tree.map(lambda r: r.block_until_ready(), last_out)
         warmup_elapsed = time.perf_counter() - warmup_start
         if tasks:
             logger.info(
@@ -639,6 +651,9 @@ class CompilationManager:
                 # only required when speculative draft token counts vary.
                 _compile_one(num_tokens, dp_sharding, num_tokens, dp_sharding)
                 for num_reqs in self.runner.num_reqs_paddings:
+                    if (vllm_envs.VLLM_TPU_USING_PATHWAYS
+                            and num_tokens == num_reqs):
+                        continue
                     _compile_one(num_tokens, dp_sharding, num_reqs,
                                  replicated_sharding)
 
@@ -1989,22 +2004,28 @@ class CompilationManager:
 
         # We also need to construct TPUSupportedSamplingMetadata
         # For greedy decoding, we can use empty parameters
-        _cache_collision_dummy = jnp.zeros((2, ), dtype=jnp.int32)
-        _cache_collision_dummy = device_array(self.runner.mesh,
-                                              _cache_collision_dummy)
-        sampling_metadata = TPUSupportedSamplingMetadata(
-            temperature=None,
-            top_k=None,
-            top_p=None,
-            _cache_collision_dummy=_cache_collision_dummy,
-            do_sampling=False,
-            logprobs=False)
+        from tpu_inference.runner.tpu_runner import _compute_active_mask
+
+        dummy_sharding = NamedSharding(self.runner.mesh, PartitionSpec())
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            _cache_collision_dummy = device_array(self.runner.mesh,
+                                                  np.zeros((2, ),
+                                                           dtype=np.int32),
+                                                  sharding=dummy_sharding)
+        else:
+            _cache_collision_dummy = jnp.zeros((2, ), dtype=jnp.int32)
+            _cache_collision_dummy = device_array(self.runner.mesh,
+                                                  _cache_collision_dummy)
 
         for num_reqs in self.runner.num_reqs_paddings:
             init_tokens = self._create_dummy_tensor((num_reqs, ), jnp.int32,
                                                     dp_sharding)
-            active_mask = self._create_dummy_tensor((num_reqs, ), jnp.bool_,
-                                                    dp_sharding)
+            if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+                active_mask = _compute_active_mask(init_tokens, dp_size,
+                                                   num_reqs // dp_size)
+            else:
+                active_mask = self._create_dummy_tensor((num_reqs, ),
+                                                        jnp.bool_, dp_sharding)
 
             seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
                                                  jnp.int32, dp_sharding)
@@ -2039,6 +2060,11 @@ class CompilationManager:
                                             sharding=dp_sharding)
                 return block_tables
 
+            attn_padded_num_reqs = (runner_utils.get_padded_token_len(
+                self.runner.attn_num_reqs_paddings_per_dp,
+                num_reqs // dp_size) * dp_size
+                                    if vllm_envs.VLLM_TPU_USING_PATHWAYS else
+                                    num_reqs)
             if len(self.runner.kv_cache_config.kv_cache_groups) <= 1:
                 no_kv_cache = len(
                     self.runner.kv_cache_config.kv_cache_groups) == 0
@@ -2051,7 +2077,7 @@ class CompilationManager:
                     query_start_loc=query_start_loc,
                     request_distribution=request_distribution,
                     mamba_state_indices=mamba_state_indices,
-                    padded_num_reqs=num_reqs,
+                    padded_num_reqs=attn_padded_num_reqs,
                 )
             else:
                 attn_metadata = GroupedAttentionMetadata(
@@ -2063,7 +2089,7 @@ class CompilationManager:
                             query_start_loc=query_start_loc,
                             request_distribution=request_distribution,
                             mamba_state_indices=mamba_state_indices,
-                            padded_num_reqs=num_reqs,
+                            padded_num_reqs=attn_padded_num_reqs,
                         ) for gid in range(
                             len(self.runner.kv_cache_config.kv_cache_groups))),
                     layer_names_per_group=tuple(
@@ -2081,8 +2107,12 @@ class CompilationManager:
             lora_metadata = self.runner.lora_utils.extract_lora_metadata()
 
             # Compile once for the max steps using JAX array for dynamic bound
-            max_decode_steps_arr = jnp.array(user_max_decode_steps,
-                                             dtype=jnp.int32)
+            max_decode_steps_arr = (device_array(self.runner.mesh,
+                                                 np.array(1, dtype=np.int32),
+                                                 sharding=dummy_sharding)
+                                    if vllm_envs.VLLM_TPU_USING_PATHWAYS else
+                                    jnp.array(user_max_decode_steps,
+                                              dtype=jnp.int32))
 
             def continue_decode_wrapper(
                 state,
@@ -2140,29 +2170,46 @@ class CompilationManager:
                 new_args[7] = self.runner.kv_caches
                 return _fn(*new_args, **_call_kwargs)
 
-            self._run_compilation(
-                f"worker{self.runner.rank} continue_decode_steps_{user_max_decode_steps}_reqs_{num_reqs}",
-                continue_decode_wrapper,
-                self.runner.state_leaves,
-                self.runner.model.step_fn_no_options,
-                self.runner.compute_logits_fn,
-                sample,
-                self.runner.mesh,
-                sampling_metadata,
-                init_state,
-                self.runner.kv_caches,
-                max_decode_steps_arr,
-                user_max_decode_steps,
-                self.runner.eos_token_id,
-                self.runner.pad_token_id,
-                self.runner.rng_params_for_sampling,
-                tuple(self.runner.layer_name_to_kvcache_index.items()),
-                lora_metadata,
-                self.runner.is_first_rank,
-                self.runner.is_last_rank,
-                self.runner.dp_size,
-                self.runner.vllm_config.aux_output_config.
-                enable_return_routed_experts,
-                self.runner.continue_decode_eos_check_interval,
-                warmup_handler=continue_decode_warmup,
-            )
+            for do_sampling in ((False, True)
+                                if vllm_envs.VLLM_TPU_USING_PATHWAYS else
+                                (False, )):
+                sampling_metadata = TPUSupportedSamplingMetadata(
+                    temperature=self._create_dummy_tensor(
+                        (num_reqs, ), jnp.float32, dp_sharding)
+                    if do_sampling else None,
+                    top_k=self._create_dummy_tensor(
+                        (num_reqs, ), jnp.int32, dp_sharding)
+                    if do_sampling else None,
+                    top_p=self._create_dummy_tensor(
+                        (num_reqs, ), jnp.float32, dp_sharding)
+                    if do_sampling else None,
+                    _cache_collision_dummy=_cache_collision_dummy,
+                    do_sampling=do_sampling,
+                    logprobs=False,
+                )
+                self._run_compilation(
+                    f"worker{self.runner.rank} continue_decode_steps_{user_max_decode_steps}_reqs_{num_reqs}_sample_{do_sampling}",
+                    continue_decode_wrapper,
+                    self.runner.state_leaves,
+                    self.runner.model.step_fn_no_options,
+                    self.runner.compute_logits_fn,
+                    sample,
+                    self.runner.mesh,
+                    sampling_metadata,
+                    init_state,
+                    self.runner.kv_caches,
+                    max_decode_steps_arr,
+                    user_max_decode_steps,
+                    self.runner.eos_token_id,
+                    self.runner.pad_token_id,
+                    self.runner.rng_params_for_sampling,
+                    tuple(self.runner.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    self.runner.is_first_rank,
+                    self.runner.is_last_rank,
+                    self.runner.dp_size,
+                    self.runner.vllm_config.aux_output_config.
+                    enable_return_routed_experts,
+                    self.runner.continue_decode_eos_check_interval,
+                    warmup_handler=continue_decode_warmup,
+                )

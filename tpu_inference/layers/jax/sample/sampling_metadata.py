@@ -19,6 +19,7 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 import numpy as np
+import vllm.envs as vllm_envs
 from jax.sharding import Mesh
 
 from tpu_inference.runner.input_batch import InputBatch
@@ -29,6 +30,8 @@ DEFAULT_SAMPLING_PARAMS = dict(
     top_k=0,
     top_p=1.0,
 )
+
+_CACHE_COLLISION_DUMMY_CACHE: dict[tuple[int, bool], jax.Array] = {}
 
 
 @functools.partial(
@@ -64,13 +67,23 @@ class TPUSupportedSamplingMetadata:
         # Use a dummy tensor with a unique shape for each logprobs config.
         # This avoids persistent cache collisions.
         dummy_shape = (1 if needs_logprobs else 2, )
-        cache_collision_dummy = np.zeros(dummy_shape, dtype=np.int32)
-        # Use replicated sharding for dummy tensor.
-        cache_collision_dummy = device_array(
-            mesh,
-            cache_collision_dummy,
-            sharding=jax.sharding.NamedSharding(mesh,
-                                                jax.sharding.PartitionSpec()))
+        dummy_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec())
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            cache_key = (id(mesh), bool(needs_logprobs))
+            cache_collision_dummy = _CACHE_COLLISION_DUMMY_CACHE.get(cache_key)
+            if cache_collision_dummy is None or cache_collision_dummy.is_deleted():
+                cache_collision_dummy = device_array(
+                    mesh,
+                    np.zeros(dummy_shape, dtype=np.int32),
+                    sharding=dummy_sharding)
+                _CACHE_COLLISION_DUMMY_CACHE[cache_key] = cache_collision_dummy
+        else:
+            cache_collision_dummy = np.zeros(dummy_shape, dtype=np.int32)
+            # Use replicated sharding for dummy tensor.
+            cache_collision_dummy = device_array(mesh,
+                                                 cache_collision_dummy,
+                                                 sharding=dummy_sharding)
 
         if input_batch.all_greedy:
             return cls(do_sampling=False,
@@ -103,16 +116,30 @@ class TPUSupportedSamplingMetadata:
                                   DEFAULT_SAMPLING_PARAMS["top_p"])
 
         # Slice persistent device tensors to a fixed pre-compiled padded shape.
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            temperature, top_p, top_k = device_array(
+                mesh,
+                (
+                    temp_tensor[:padded_num_reqs],
+                    top_p_tensor[:padded_num_reqs],
+                    top_k_tensor[:padded_num_reqs],
+                ),
+                sharding=sharding,
+            )
+        else:
+            temperature = device_array(mesh,
+                                       temp_tensor[:padded_num_reqs],
+                                       sharding=sharding)
+            top_p = device_array(mesh,
+                                 top_p_tensor[:padded_num_reqs],
+                                 sharding=sharding)
+            top_k = device_array(mesh,
+                                 top_k_tensor[:padded_num_reqs],
+                                 sharding=sharding)
         return cls(
-            temperature=device_array(mesh,
-                                     temp_tensor[:padded_num_reqs],
-                                     sharding=sharding),
-            top_p=device_array(mesh,
-                               top_p_tensor[:padded_num_reqs],
-                               sharding=sharding),
-            top_k=device_array(mesh,
-                               top_k_tensor[:padded_num_reqs],
-                               sharding=sharding),
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
             _cache_collision_dummy=cache_collision_dummy,
             do_sampling=not input_batch.all_greedy,
             logprobs=needs_logprobs,

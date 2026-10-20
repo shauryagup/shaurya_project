@@ -203,14 +203,23 @@ def _scheduler_worker_process(
 
     logger.info(f"Scheduler worker process {rank} started (PID={os.getpid()})")
 
+    last_result = None
+
     def _send_result(result):
         """Send result back using cloudpickle serialization."""
-        output_conn.send_bytes(cloudpickle.dumps(result))
+        nonlocal last_result
+        if output_conn is None:
+            last_result = result
+        else:
+            output_conn.send_bytes(cloudpickle.dumps(result))
 
     # Process commands from the input connection
     while True:
         try:
-            command, data = cloudpickle.loads(input_conn.recv_bytes())
+            if input_conn is None:
+                command, data = yield last_result
+            else:
+                command, data = cloudpickle.loads(input_conn.recv_bytes())
 
             match command:
                 case SchedulerCommand.ADD_REQUEST:
@@ -388,6 +397,9 @@ def _scheduler_worker_process(
                     logger.info(f"Rank {rank}: Shutting down")
                     scheduler.shutdown()
                     _send_result(None)  # Signal completion
+                    if input_conn is None:
+                        yield last_result
+                        return
                     os._exit(0)
                 case _:
                     error = SchedulerWorkerError(
@@ -413,6 +425,11 @@ def _scheduler_worker_process(
 
             error = SchedulerWorkerError(rank, str(e))
             _send_result(error)
+
+
+def _run_scheduler_worker(*args):
+    for _ in _scheduler_worker_process(*args):
+        pass
 
 
 @dataclass
@@ -520,6 +537,28 @@ class DPScheduler(SchedulerInterface):
         # The original scheduler class could be Scheduler or AsyncScheduler
         original_scheduler_cls = vllm_config.scheduler_config._original_scheduler_cls
 
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            self._workers = []
+            self._results: List[deque] = [deque() for _ in range(self.dp_size)]
+            for rank in range(self.dp_size):
+                worker = _scheduler_worker_process(
+                    rank,
+                    None,
+                    None,
+                    self.vllm_config,
+                    self.per_rank_kv_cache_configs[rank],
+                    structured_output_manager,
+                    block_size,
+                    self.hash_block_size,
+                    mm_registry,
+                    include_finished_set,
+                    log_stats,
+                    original_scheduler_cls,
+                )
+                next(worker)
+                self._workers.append(worker)
+            return
+
         # Enable cloudpickle for multiprocessing to handle local functions
         _enable_cloudpickle()
 
@@ -548,7 +587,7 @@ class DPScheduler(SchedulerInterface):
             self.output_conns.append(output_parent_conn)
 
             process = ctx.Process(
-                target=_scheduler_worker_process,
+                target=_run_scheduler_worker,
                 args=(
                     rank,
                     input_child_conn,
@@ -635,6 +674,10 @@ class DPScheduler(SchedulerInterface):
                       command: SchedulerCommand,
                       data: Any = None) -> None:
         """Send a command to a worker process via its input pipe."""
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            self._results[rank].append(self._workers[rank].send(
+                (command, data)))
+            return
         start_time = time()
         payload = cloudpickle.dumps((command, data))
         serialize_time = time() - start_time
@@ -657,6 +700,11 @@ class DPScheduler(SchedulerInterface):
         threads that Queue uses, avoiding GIL contention and thread convoy
         effects at high DP sizes.
         """
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            result = self._results[rank].popleft()
+            if isinstance(result, SchedulerWorkerError):
+                raise result
+            return result
         cmd_name = command.value if command else "unknown"
         try:
             start_time = time()
@@ -716,6 +764,10 @@ class DPScheduler(SchedulerInterface):
         command: SchedulerCommand,
     ) -> List[Any]:
         """Collect results from all ranks using wait() to avoid HOL blocking."""
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            return [
+                self._get_result(rank, command) for rank in range(self.dp_size)
+            ]
         results: List[Any] = [None] * self.dp_size
         pending = list(self.output_conns)
         collected = 0
@@ -806,6 +858,9 @@ class DPScheduler(SchedulerInterface):
             min_remaining[rank] = self._get_result(
                 rank, SchedulerCommand.GET_MIN_REMAINING_OUTPUT)
 
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            return min(range(self.dp_size),
+                       key=lambda r: (inflight[r], loads[r], min_remaining[r]))
         return min(range(self.dp_size),
                    key=lambda r: (loads[r], inflight[r], min_remaining[r]))
 
@@ -905,7 +960,9 @@ class DPScheduler(SchedulerInterface):
                          self._schedule_step_count - 1, e2e_step_time)
         self._prev_schedule_start = now
 
-        if self._batch_prefills:
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS and self._pending_new_requests:
+            self._flush_pending()
+        elif self._batch_prefills:
             self._try_flush_pending()
 
         # Run each scheduler independently
@@ -1260,7 +1317,9 @@ class DPScheduler(SchedulerInterface):
         combines their outputs, similar to how other operations are handled.
         """
         # Use the most recent cached outputs from the schedule() call
-        if not self.cached_schedulers_output:
+        if (not self.cached_schedulers_output or
+            (vllm_envs.VLLM_TPU_USING_PATHWAYS
+             and not scheduler_output.has_structured_output_requests)):
             return None
 
         combined_structured_output_request_ids = []
@@ -1314,8 +1373,11 @@ class DPScheduler(SchedulerInterface):
                             req_id] = num_sampled
 
         # Split model output by DP rank (each rank gets only its req_ids).
-        rank_model_outputs = self._split_model_output_by_rank(
-            scheduler_output, model_runner_output)
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            rank_model_outputs = [model_runner_output] * self.dp_size
+        else:
+            rank_model_outputs = self._split_model_output_by_rank(
+                scheduler_output, model_runner_output)
         self.cached_schedulers_output.popleft()
 
         for rank in range(self.dp_size):
@@ -1676,6 +1738,10 @@ class DPScheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         """Shutdown all DP rank scheduler worker processes."""
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            for rank in range(self.dp_size):
+                self._send_command(rank, SchedulerCommand.SHUTDOWN)
+            return
         atexit.unregister(self._atexit_cleanup)
 
         # Send shutdown command to all workers, skipping dead ones
@@ -1727,6 +1793,18 @@ def update_vllm_config_for_dp_scheduler(vllm_config: Any) -> None:
     """
     Update vLLM configuration to use DPScheduler when DP size > 1.
     """
+    if (vllm_envs.VLLM_TPU_USING_PATHWAYS
+            and vllm_config.parallel_config.prefill_context_parallel_size == 1
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and vllm_config.model_config.runner_type != "pooling"):
+        vllm_config.additional_config.setdefault("enable_continue_decode", True)
+        vllm_config.additional_config.setdefault("max_decode_steps", 16)
+        if vllm_config.additional_config["enable_continue_decode"]:
+            vllm_config.scheduler_config.async_scheduling = False
+            from tpu_inference.core.sched.utils import \
+                patch_vllm_scheduler_for_continue_decode
+            patch_vllm_scheduler_for_continue_decode()
+
     dp_size = vllm_config.sharding_config.total_dp_size
 
     if dp_size > 1:

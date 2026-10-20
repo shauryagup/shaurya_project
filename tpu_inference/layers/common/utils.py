@@ -16,6 +16,8 @@ from contextlib import nullcontext
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import vllm.envs as vllm_envs
 from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, Sharding
 
@@ -51,6 +53,14 @@ def reorder_concatenated_tensor_for_sharding(concatenated_tensor: jax.Array,
     old_shape = concatenated_tensor.shape
     # New shape ensures each split_tensor[i] maps to a tensor in ith shards
     new_shape = old_shape[:dim] + (n_shards, -1) + old_shape[dim + 1:]
+    if isinstance(concatenated_tensor, np.ndarray):
+        for split_size in split_sizes:
+            slc = (slice(None), ) * dim + (slice(
+                start_offset, start_offset + split_size), )
+            split_tensors.append(concatenated_tensor[slc].reshape(new_shape))
+            start_offset += split_size
+        return np.ascontiguousarray(
+            np.concatenate(split_tensors, axis=dim + 1).reshape(old_shape))
     for split_size in split_sizes:
         split_tensor = jax.lax.slice_in_dim(concatenated_tensor,
                                             start_offset,
@@ -136,6 +146,12 @@ def general_device_put(tensor: jax.Array,
 
     `source_mesh` specifies the mesh on which the input tensor is currently located.
     """
+
+    if vllm_envs.VLLM_TPU_USING_PATHWAYS and layout is None:
+        if (isinstance(tensor, jax.Array) and isinstance(sharding, Sharding)
+                and tensor.sharding.is_equivalent_to(sharding, tensor.ndim)):
+            return tensor
+        return jax.device_put(tensor, sharding)
 
     def _put(t):
         multihost_backend = envs.TPU_MULTIHOST_BACKEND

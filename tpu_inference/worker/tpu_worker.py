@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import jax
 import jaxlib
+import vllm.envs as vllm_envs
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
                                           has_kv_transfer_group)
@@ -408,8 +409,19 @@ class TPUWorker(WorkerBase):
                 else:
                     # In a multi-host distributed env, say: Ray, local_device count may smaller
                     # than the total devices, we just choose the smaller set here.
-                    self.devices = jax.devices()[:sharding_config.
-                                                 total_devices]
+                    devices = jax.devices()
+                    if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+                        devices = sorted(
+                            devices,
+                            key=lambda d: (
+                                d.slice_index,
+                                d.coords[1] // 2,
+                                d.coords[0] // 2,
+                                d.coords[1],
+                                d.coords[0],
+                            ),
+                        )
+                    self.devices = devices[:sharding_config.total_devices]
 
         # Initialize the vLLM distribution layer as a single chip environment,
         # we'll swap the model's parallel modules with TPU SPMD equivalents.

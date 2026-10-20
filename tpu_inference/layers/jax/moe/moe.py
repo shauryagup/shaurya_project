@@ -17,6 +17,7 @@ from typing import Any, Iterable, Iterator, Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from flax.typing import Sharding
 from jax.sharding import NamedSharding, PartitionSpec
@@ -329,8 +330,14 @@ class JaxMoE(JaxModule):
         }.items():
             weights_to_load = param._weights_to_load
             if all(w is not None for w in weights_to_load):
-                with cpu_mesh_context():
-                    weights = jnp.concatenate(param._weights_to_load, axis=0)
+                if any(isinstance(w, bool) for w in weights_to_load):
+                    loaded_names.add(param_name)
+                    continue
+                if isinstance(weights_to_load[0], np.ndarray):
+                    weights = np.concatenate(weights_to_load, axis=0)
+                else:
+                    with cpu_mesh_context():
+                        weights = jnp.concatenate(weights_to_load, axis=0)
                 try:
                     param.value = shard_put(weights, param.out_sharding, mesh)
                     loaded_names.add(param_name)
@@ -517,10 +524,16 @@ class JaxRoutedExperts(JaxModule):
                 "kernel_up_proj_EDF": self.kernel_up_proj_EDF,
                 "kernel_down_proj_EFD": self.kernel_down_proj_EFD,
         }.items():
-            if all(w is not None for w in param._weights_to_load):
-                with cpu_mesh_context():
-                    concatenated = jnp.concatenate(param._weights_to_load,
-                                                   axis=0)
+            weights_to_load = param._weights_to_load
+            if all(w is not None for w in weights_to_load):
+                if any(isinstance(w, bool) for w in weights_to_load):
+                    loaded_names.add(name)
+                    continue
+                if isinstance(weights_to_load[0], np.ndarray):
+                    concatenated = np.concatenate(weights_to_load, axis=0)
+                else:
+                    with cpu_mesh_context():
+                        concatenated = jnp.concatenate(weights_to_load, axis=0)
                 param.value = shard_put(concatenated, param.out_sharding, mesh)
                 loaded_names.add(name)
         return loaded_names

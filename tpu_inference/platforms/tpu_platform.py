@@ -365,6 +365,28 @@ class TpuPlatform(Platform):
         logger.info("Resolved TPU_MULTIPROCESS_DP=%s",
                     os.environ["TPU_MULTIPROCESS_DP"])
 
+    _pathways_model_config_patched: bool = False
+
+    @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        if (not vllm_envs.VLLM_TPU_USING_PATHWAYS
+                or cls._pathways_model_config_patched):
+            return
+        from vllm.config.model import ModelConfig as _VllmModelConfig
+        orig_verify = _VllmModelConfig.verify_with_parallel_config
+
+        def _verify_with_parallel_config(self, parallel_config) -> None:
+            total_heads = self.model_arch_config.total_num_attention_heads
+            tp_size = parallel_config.tensor_parallel_size
+            if total_heads % tp_size != 0 and tp_size % total_heads == 0:
+                object.__setattr__(self.model_arch_config,
+                                   "total_num_attention_heads", tp_size)
+            orig_verify(self, parallel_config)
+
+        _VllmModelConfig.verify_with_parallel_config = (
+            _verify_with_parallel_config)
+        cls._pathways_model_config_patched = True
+
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
 

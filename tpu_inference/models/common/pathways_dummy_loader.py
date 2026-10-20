@@ -19,8 +19,8 @@ CPU allocation.
 Works for both the ``flax_nnx`` (JAX) and ``vllm`` (torchax) backends.
 """
 
+import functools
 import time
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -53,19 +53,24 @@ def is_pathways_dummy_load() -> bool:
     return load_format in ("dummy", "pathways_dummy")
 
 
-@partial(jax.jit, static_argnames=("shape", "dtype"))
-def _generate_dummy_weights_kernel(
-    key: jax.Array,
+@functools.cache
+def _get_dummy_weight_allocator(
     shape: tuple[int, ...],
     dtype: jnp.dtype,
-) -> jax.Array:
-    return jax.random.uniform(
-        key,
-        shape=shape,
-        dtype=dtype,
-        minval=_LOW,
-        maxval=_HIGH,
-    )
+    sharding: NamedSharding,
+):
+
+    @functools.partial(jax.jit, out_shardings=sharding)
+    def _allocate() -> jax.Array:
+        return jax.random.uniform(
+            jax.random.PRNGKey(_SEED),
+            shape=shape,
+            dtype=dtype,
+            minval=_LOW,
+            maxval=_HIGH,
+        )
+
+    return _allocate
 
 
 def create_dummy_weights_on_tpu(
@@ -77,9 +82,11 @@ def create_dummy_weights_on_tpu(
 
     The values are drawn uniformly from ``[_LOW, _HIGH]``.
     """
-    key = jax.random.PRNGKey(_SEED)
-    tpu_array = _generate_dummy_weights_kernel(key, weight_shape, weight_dtype)
-    return jax.lax.with_sharding_constraint(tpu_array, sharding)
+    return _get_dummy_weight_allocator(
+        tuple(weight_shape),
+        jnp.dtype(weight_dtype),
+        sharding,
+    )()
 
 
 def load_dummy_weights_jax(model, mesh: Mesh) -> None:
@@ -114,10 +121,14 @@ def load_dummy_weights_jax(model, mesh: Mesh) -> None:
         )
 
         if is_moe:
-            param._weights_to_load[:] = jnp.vsplit(
-                dummy, indices_or_sections=num_experts)
+            if dummy.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2):
+                param._weights_to_load[:] = jnp.vsplit(
+                    dummy, indices_or_sections=num_experts)
+            else:
+                param._weights_to_load[:] = [True] * num_experts
 
-        assign_and_shard_param(param, dummy, param_name)
+        param.set_value(dummy)
+        param.set_metadata("_is_loaded", True)
 
     # Post-process (quantisation etc.) per-module.
     _process_weights_after_loading_jax(model)

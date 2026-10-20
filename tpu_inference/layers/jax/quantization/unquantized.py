@@ -18,6 +18,7 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -151,9 +152,9 @@ class UnquantizedMergedLinearMethod(UnquantizedLinearMethod):
                 shards[shard_id] = torch_tensor
                 if any(s is None for s in shards):
                     return
-                consolidated = jnp.concatenate(
-                    [jax_array_from_reshaped_torch(t) for t in shards],
-                    axis=out_dim)
+                converted = [jax_array_from_reshaped_torch(t) for t in shards]
+                xp = np if isinstance(converted[0], np.ndarray) else jnp
+                consolidated = xp.concatenate(converted, axis=out_dim)
 
             for out_size in output_sizes:
                 assert out_size % n_shards == 0, (

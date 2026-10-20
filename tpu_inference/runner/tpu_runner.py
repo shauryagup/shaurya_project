@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+import vllm.envs as vllm_envs
 import vllm.lora.utils as lora_utils_mod
 from flax import nnx
 from jax._src.pallas.utils import next_power_of_2
@@ -300,6 +301,12 @@ def _process_continue_decode_outputs(
         req_state = requests_dict.get(
             req_id) if requests_dict is not None else None
         actual_len = int(valid_lens[req_idx])
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS and req_state is not None:
+            if req_state.sampling_params.ignore_eos:
+                actual_len = actual_steps_int
+            rem_gen = req_state.sampling_params.max_tokens - len(
+                req_state.output_token_ids)
+            actual_len = min(actual_len, max(0, rem_gen))
         valid_tokens = generated_tokens_cpu[req_idx, :actual_len].tolist()
         sampled_token_ids.append(valid_tokens)
 
@@ -854,12 +861,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         """Generative model or pooling model select different computations."""
         self.enable_continue_decode = self.vllm_config.additional_config.get(
             "enable_continue_decode", False)
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS and self.enable_continue_decode:
+            from tpu_inference.core.sched.utils import \
+                patch_vllm_scheduler_for_continue_decode
+            patch_vllm_scheduler_for_continue_decode()
         # continue_decode EOS-check interval: how often the fused decode loop
         # observes the any-sequence-hit-EOS early exit (see decode_loop.py). Set
         # via the CONTINUE_DECODE_EOS_CHECK_INTERVAL env var so it can be retuned
         # per model family / serving fleet without a rebuild. Default 1 = stock
         # every-step check.
         self.continue_decode_eos_check_interval = (
+            0 if vllm_envs.VLLM_TPU_USING_PATHWAYS else
             envs.CONTINUE_DECODE_EOS_CHECK_INTERVAL)
         self.static_max_decode_steps = self.vllm_config.additional_config.get(
             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
@@ -886,6 +898,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def _create_new_model_mesh(self) -> jax.sharding.Mesh:
         num_slices = envs.NUM_SLICES
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS and num_slices == 1:
+            num_slices = len({d.slice_index for d in self.devices})
 
         logger.info(f"Creating new model mesh | devices={len(self.devices)}, "
                     f"num_slices={num_slices}")
@@ -1113,9 +1127,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # the bucket list through the same merge as `compilation_sizes` (and
         # the PCP headroom bucket above), and unreachable generated buckets
         # above it are dropped.
+        min_token_size = (envs.MIN_TOKEN_BUCKET * self.dp_size
+                          if vllm_envs.VLLM_TPU_USING_PATHWAYS else max(
+                              envs.MIN_TOKEN_BUCKET,
+                              next_power_of_2(self.dp_size * kv_packing)))
         self.num_tokens_paddings = runner_utils.build_token_paddings(
-            min_token_size=max(envs.MIN_TOKEN_BUCKET,
-                               next_power_of_2(self.dp_size * kv_packing)),
+            min_token_size=min_token_size,
             max_token_size=scheduler_config.max_num_batched_tokens *
             self.dp_size,
             padding_gap=envs.VLLM_TPU_BUCKET_PADDING_GAP,
@@ -1162,7 +1179,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Used to initialize positions / context_lens / seq_lens
         # Keep in int64 to avoid overflow with long context
         self.arange_cpu = np.arange(self.max_num_tokens, dtype=np.int64)
-        min_num_reqs = max(MIN_NUM_SEQS, next_power_of_2(self.dp_size))
+        min_num_reqs = (MIN_NUM_SEQS * self.dp_size
+                        if vllm_envs.VLLM_TPU_USING_PATHWAYS else max(
+                            MIN_NUM_SEQS, next_power_of_2(self.dp_size)))
         self.num_reqs_paddings = runner_utils.get_req_paddings(
             min_req_size=min_num_reqs, max_req_size=self.max_num_reqs)
 
@@ -1238,7 +1257,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # known.
         self.device_buffer = common_utils.DeviceBuffer(initial_capacity=1024)
         # Cache a zero scalar JAX array to avoid eager allocation overhead during continue_decode cycles.
-        self.zero_array = jnp.array(0, dtype=jnp.int32)
+        self.zero_array = (device_array(
+            self.mesh,
+            np.array(0, dtype=np.int32),
+            sharding=NamedSharding(self.mesh, PartitionSpec()))
+                           if vllm_envs.VLLM_TPU_USING_PATHWAYS else
+                           jnp.array(0, dtype=jnp.int32))
+        self._decode_step_arrays: dict[int, jax.Array] = {}
 
     def load_model(self):
         with set_current_vllm_config(self.vllm_config):
@@ -1850,7 +1875,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         remaining_slots = self.max_model_len - num_tokens
         if len(remaining_slots) == 0:
             return 0
-        return int(np.min(remaining_slots))
+        min_slots = int(np.min(remaining_slots))
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            max_rem_gen = max(
+                self.requests[rid].sampling_params.max_tokens -
+                len(self.requests[rid].output_token_ids)
+                for rid in self.input_batch.req_ids[:self.input_batch.num_reqs]
+            )
+            return max(0, min(min_slots, max_rem_gen))
+        return min_slots
 
     def _execute_continue_decode(
         self,
@@ -1896,7 +1929,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         max_decode_steps = min(self.static_max_decode_steps, min_remaining)
         if max_decode_steps <= 0:
             max_decode_steps = 1
-        max_decode_steps_arr = jnp.array(max_decode_steps, dtype=jnp.int32)
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            if max_decode_steps not in self._decode_step_arrays:
+                self._decode_step_arrays[max_decode_steps] = device_array(
+                    self.mesh,
+                    np.array(max_decode_steps, dtype=np.int32),
+                    sharding=NamedSharding(self.mesh, PartitionSpec()))
+            max_decode_steps_arr = self._decode_step_arrays[max_decode_steps]
+        else:
+            max_decode_steps_arr = jnp.array(max_decode_steps, dtype=jnp.int32)
 
         lora_metadata = self.lora_utils.extract_lora_metadata()
 
@@ -3076,7 +3117,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     self.kv_cache_config.kv_cache_groups):
                 build_block_table_host(gid)
 
-        metadata_blob, metadata_layout = self.device_buffer.build()
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+            metadata_blob = self.device_buffer.build_dict()
+            metadata_layout = None
+        else:
+            metadata_blob, metadata_layout = self.device_buffer.build()
 
         # Mamba slot ids are only consumed by hybrid attn+mamba models; for
         # pure-attention models, leaving the field None keeps AttentionMetadata
@@ -3113,8 +3158,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.mesh, (request_distribution, metadata_blob),
                 sharding=metadata_attn_sharding)
 
-        metadata = common_utils.DeviceBuffer.unpack_arrays(
-            dev_arrays_payload, metadata_layout)
+        if metadata_layout is None:
+            metadata = dev_arrays_payload
+        else:
+            metadata = common_utils.DeviceBuffer.unpack_arrays(
+                dev_arrays_payload, metadata_layout)
         input_ids = metadata["input_ids"]
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]

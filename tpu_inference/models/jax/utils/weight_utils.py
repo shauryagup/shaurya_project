@@ -30,6 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import torchax
+import vllm.envs as vllm_envs
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -50,7 +51,7 @@ from tpu_inference.models.common.layer_filter import (
     filter_safetensors_by_layer, num_hidden_layers_override,
     should_skip_layer_weight)
 from tpu_inference.models.jax.utils import file_utils
-from tpu_inference.utils import t2j
+from tpu_inference.utils import t2j, torch_to_numpy
 
 logger = init_logger(__name__)
 
@@ -231,7 +232,7 @@ def shard_put(x: jax.Array,
         mesh = get_mesh()
 
     x_mesh = None
-    if isinstance(x.sharding, NamedSharding):
+    if isinstance(x, jax.Array) and isinstance(x.sharding, NamedSharding):
         x_mesh = x.sharding.mesh
 
     if math.prod(mesh.axis_sizes) == 1:
@@ -773,11 +774,28 @@ def jax_array_from_reshaped_torch(
         permute_dims: Optional tuple specifying the permutation of dimensions. If None, no-op for 1D tensors and transpose for 2D tensors is applied.
     """
     if reshape_dims is not None:
-        torch_weight = torch_weight.reshape(reshape_dims)
+        if (vllm_envs.VLLM_TPU_USING_PATHWAYS
+                and torch_weight.numel() < math.prod(reshape_dims)):
+            rep = math.prod(reshape_dims) // torch_weight.numel()
+            if torch_weight.shape[0] == reshape_dims[0]:
+                unpadded = (reshape_dims[0], reshape_dims[1] // rep,
+                            *reshape_dims[2:])
+                torch_weight = (
+                    torch_weight.reshape(unpadded).repeat_interleave(
+                        rep, dim=1) / rep).to(torch_weight.dtype)
+            else:
+                unpadded = (reshape_dims[0] // rep, *reshape_dims[1:])
+                torch_weight = torch_weight.reshape(unpadded).repeat_interleave(
+                    rep, dim=0)
+        else:
+            torch_weight = torch_weight.reshape(reshape_dims)
     if permute_dims is None and torch_weight.ndim == 2:
         permute_dims = (1, 0)
     if permute_dims is not None:
         torch_weight = torch_weight.permute(*permute_dims)
+
+    if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+        return torch_to_numpy(torch_weight)
 
     with cpu_mesh_context():
         return t2j(torch_weight, use_dlpack=False)
@@ -872,8 +890,11 @@ def load_nnx_param_from_reshaped_torch(
                 )
                 # Use NumPy to keep it on Host
                 jax_weight_np = np.pad(np.asarray(jax_weight), pad_width)
-                with cpu_mesh_context():
-                    jax_weight = jnp.array(jax_weight_np)
+                if isinstance(jax_weight, np.ndarray):
+                    jax_weight = jax_weight_np
+                else:
+                    with cpu_mesh_context():
+                        jax_weight = jnp.array(jax_weight_np)
         else:
             raise ValueError(
                 f"Shape mismatch in non-vocab layer '{param_name}': torch {jax_weight.shape} vs jax {jax_param.get_value().shape}"
@@ -1124,6 +1145,12 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
             return
         if (quant_method := getattr(module, 'quant_method', None)) is not None:
             assert isinstance(quant_method, QuantizeMethodBase)
+            if (vllm_envs.VLLM_TPU_USING_PATHWAYS
+                    and type(quant_method).process_weights_after_loading
+                    is QuantizeMethodBase.process_weights_after_loading):
+                self._process_weights_after_loading_per_module[
+                    base_prefix] = True
+                return
             loaded = quant_method.process_weights_after_loading(module)
             jax.clear_caches()
             assert isinstance(loaded, bool)

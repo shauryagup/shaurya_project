@@ -64,7 +64,8 @@ from tpu_inference.logger import init_logger
 from tpu_inference.models.common.pathways_dummy_loader import (
     create_dummy_weights_on_tpu, is_pathways_dummy_load)
 from tpu_inference.utils import (_NUMPY_UNSUPPORTED_DTYPES,
-                                 get_mesh_shape_product, to_jax_dtype)
+                                 get_mesh_shape_product, to_jax_dtype,
+                                 torch_to_numpy)
 
 P = PartitionSpec
 
@@ -202,9 +203,7 @@ def _load_weight_for_layer(
         )
 
     # Pathways real-weight path
-    dtype = to_jax_dtype(tensor.dtype)
-    np_tensor = tensor.detach().cpu().to(torch.float32).numpy()
-    return jax.device_put(np_tensor, sharding).astype(dtype)
+    return jax.device_put(torch_to_numpy(tensor), sharding)
 
 
 def _prefix_matches(prefix: str, patterns: Sequence[str]) -> bool:

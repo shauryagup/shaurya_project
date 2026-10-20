@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import itertools
+import math
 import time
 from collections import defaultdict
 from collections.abc import Sequence
@@ -138,6 +139,15 @@ _NUMPY_UNSUPPORTED_DTYPES = {
     torch.float8_e5m2: jnp.float8_e5m2,
     torch.float8_e5m2fnuz: jnp.float8_e5m2fnuz,
 }
+
+
+def torch_to_numpy(t: torch.Tensor) -> np.ndarray:
+    """Convert a torch.Tensor to a host numpy array without float32 widening."""
+    t = t.detach().cpu().contiguous()
+    if (jax_dtype := _NUMPY_UNSUPPORTED_DTYPES.get(t.dtype)) is not None:
+        return (t.reshape(-1).view(torch.uint8).numpy().view(jax_dtype).reshape(
+            t.shape))
+    return t.numpy()
 
 
 def t2j(t: torch.Tensor, use_dlpack=False):
@@ -306,6 +316,12 @@ def pathways_hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
     seen_buffers = set()
 
     for array in live_arrays:
+        if isinstance(array, jax.Array):
+            shard_bytes = (math.prod(array.sharding.shard_shape(array.shape)) *
+                           array.dtype.itemsize)
+            for dev in array.sharding.addressable_devices:
+                hbm_used[dev] += shard_bytes
+            continue
         for buffer in array.addressable_shards:
             buffer_id = id(buffer.data)
             if buffer_id not in seen_buffers:
@@ -396,7 +412,10 @@ def make_optimized_mesh(axis_shapes: Sequence[int],
     if devices is None:
         devices = xb.devices()
     # Sort the devices in case it's passed in an arbitary order
-    devices = sorted(devices, key=lambda x: x.coords)
+    if vllm_envs.VLLM_TPU_USING_PATHWAYS:
+        devices = sorted(devices, key=lambda x: (x.slice_index, x.coords))
+    else:
+        devices = sorted(devices, key=lambda x: x.coords)
 
     def _is_1D(axis_shapes):
         return sum(x > 1 for x in axis_shapes) == 1
@@ -686,6 +705,15 @@ class DeviceBuffer:
         """Return the active portion of the buffer and its layout metadata."""
         return self.buffer[:self._offset], DeviceBufferMetadata(
             keys=tuple(self._keys), sizes=tuple(self._sizes))
+
+    def build_dict(self) -> Dict[str, np.ndarray]:
+        """Return 1D NumPy views for each key without requiring device-side `jnp.split`."""
+        result: Dict[str, np.ndarray] = {}
+        offset = 0
+        for key, size in zip(self._keys, self._sizes):
+            result[key] = self.buffer[offset:offset + size]
+            offset += size
+        return result
 
     def reset(self):
         """Reset offsets and metadata for reuse. Keeps the allocated buffer."""
